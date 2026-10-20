@@ -45,6 +45,21 @@ The example server runs over HTTP. Use a reverse proxy or uvicorn TLS settings f
 docker run --rm -p 8080:8080 gnpy-api
 ```
 
+## 🔁 Network sessions
+`/path-request` designs the network again on every call. Digital twins and other SDN
+controllers can instead keep a designed network in the service and work on it step by step:
+```bash
+# load and design once; the response carries the network-id
+curl -X POST 'http://localhost:8080/api/v1.0/networks' --header 'Content-Type: application/json' \
+     --data '{"gnpy-api:topology": {...}, "gnpy-api:equipment": {...}}'
+# then compute paths, propagate, change parameters, fail fibers, redesign
+curl -X POST "http://localhost:8080/api/v1.0/networks/$NETWORK_ID/paths" \
+     --header 'Content-Type: application/json' --data '{"source": "trx Alice", "destination": "trx Bob"}'
+```
+See [docs/network-api.md](docs/network-api.md) for every endpoint. `tests/twinlight/` shows
+how the [TwinLight](https://github.com/carlosnatalino/TwinLight) digital twin would use them
+in place of importing GNPy.
+
 ## 🔄 Compatibility
 
 Different versions of this interface extension are compatible with specific versions of [GNPy](https://github.com/Telecominfraproject/oopt-gnpy). Please refer to the table below to ensure that you are using a supported version combination.

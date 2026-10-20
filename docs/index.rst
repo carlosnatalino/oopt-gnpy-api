@@ -10,6 +10,7 @@ tbd
    :maxdepth: 4
 
    intro
+   network-api
 
 Indices and tables
 ==================
