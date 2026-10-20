@@ -9,6 +9,6 @@ API_VERSION = "/api/v1.0"
 app = FastAPI()
 
 import gnpyapi.core.route.path_request_route  # noqa: E402
-import gnpyapi.core.route.network_route  # noqa: E402
+import gnpyapi.core.route.session_route  # noqa: E402
 import gnpyapi.core.route.example_data_route  # noqa: E402
 import gnpyapi.core.route.status_route  # noqa: F401, E402

@@ -27,8 +27,9 @@ from gnpy.tools.worker_utils import designed_network
 from gnpy.topology.request import PathRequest, compute_constrained_path
 
 from gnpyapi.core import app
-from tests.twinlight.remote_gnpy_backend import (MODULATION_TABLE, OpmBaseline, ParamValidationError,
-                                                 RemoteGnpyBackend, fetch_example, list_examples)
+from tests.twinlight.remote_gnpy_backend import (MODULATION_TABLE, SESSION_TOKEN_HEADER, OpmBaseline,
+                                                 ParamValidationError, RemoteGnpyBackend, SessionLostError,
+                                                 fetch_example, list_examples)
 from tests.utils.input import read_json_file
 
 GNPY_EXAMPLE_DIR = Path(gnpy.__file__).parent / 'example-data'
@@ -237,7 +238,26 @@ def test_unreachable_service_falls_back_to_mock_opm(examples):
 
 def test_close_releases_the_session(client, examples):
     backend = RemoteGnpyBackend(client, examples['edfa_example_network.json'], examples['eqpt_config.json'])
-    network_id = backend.network_id
+    token = backend._token
     backend.close()
 
-    assert client.get(f'/api/v1.0/networks/{network_id}').status_code == 404
+    assert client.get('/api/v1.0/session', headers={SESSION_TOKEN_HEADER: token}).status_code == 401
+    with pytest.raises(SessionLostError):
+        backend.read_all_attributes('Span1')
+
+
+def test_lost_session_is_reported_and_reopened(client, edfa_backend):
+    path = edfa_backend.compute_path('Site_A', 'Site_B')[0]
+    nominal = _baseline(edfa_backend, path)
+    edfa_backend.write_attribute('Span1', 'loss_coef', 0.25)
+    # e.g. the service restarted: its in-memory sessions are gone
+    client.delete('/api/v1.0/session', headers={SESSION_TOKEN_HEADER: edfa_backend._token})
+
+    # not swallowed into the mock-OPM fallback: the twin must know its overrides are gone
+    with pytest.raises(SessionLostError):
+        _baseline(edfa_backend, path)
+    edfa_backend.reopen()
+
+    assert _baseline(edfa_backend, path) == nominal
+    edfa_backend.write_attribute('Span1', 'loss_coef', 0.25)
+    assert _baseline(edfa_backend, path).gsnr_db < nominal.gsnr_db

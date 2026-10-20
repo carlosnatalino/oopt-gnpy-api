@@ -4,22 +4,24 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import Body, HTTPException, Query, Response
+from fastapi import Body, Depends, HTTPException, Query, Response, Security
+from fastapi.security import APIKeyHeader
 from gnpy.tools.convert_legacy_yang import yang_to_legacy
 
 from gnpyapi.core import API_VERSION, app
 from gnpyapi.core.exception.element_not_found_error import ElementNotFoundError
 from gnpyapi.core.exception.equipment_error import EquipmentError
-from gnpyapi.core.exception.network_not_found_error import NetworkNotFoundError
 from gnpyapi.core.exception.param_validation_error import ParamValidationError
 from gnpyapi.core.exception.path_computation_error import PathComputationError
+from gnpyapi.core.exception.session_not_found_error import SessionNotFoundError
 from gnpyapi.core.exception.topology_error import TopologyError
 from gnpyapi.core.model.network import PathComputationRequest, PropagationRequest
 from gnpyapi.core.service import element_attributes
-from gnpyapi.core.service.network_service import NetworkSession, network_store
+from gnpyapi.core.service.network_service import NetworkSession, session_store
 
-NETWORKS_BASE_PATH = API_VERSION + '/networks'
-NETWORK_PATH = NETWORKS_BASE_PATH + '/{network_id}'
+SESSIONS_PATH = API_VERSION + '/sessions'
+SESSION_PATH = API_VERSION + '/session'
+SESSION_TOKEN_HEADER = 'X-Session-Token'
 
 _PLANNING_EXAMPLE = json.loads(
     (Path(__file__).parents[2] / 'exampledata' / 'planning_demand_example.json').read_text(encoding='utf-8')
@@ -29,16 +31,28 @@ _EXAMPLE = {'gnpy-api:api': {key: value for key, value in _PLANNING_EXAMPLE['gnp
 _EXAMPLES = {'network': {'summary': 'Topology and equipment', 'value': _EXAMPLE}}
 _SCHEMA = {'type': 'object', 'example': _EXAMPLE}
 
+# Declared as a security scheme so the OpenAPI page offers to set the token once for all calls.
+_session_token = APIKeyHeader(name=SESSION_TOKEN_HEADER, scheme_name='SessionToken', auto_error=False,
+                              description='Token returned by POST ' + SESSIONS_PATH)
+
 
 @contextmanager
 def _http_errors():
     """Translate service errors into HTTP status codes."""
     try:
         yield
-    except (NetworkNotFoundError, ElementNotFoundError) as e:
+    except SessionNotFoundError as e:
+        # 401 rather than 404: the client has to open a new session, not fix a resource name
+        raise HTTPException(status_code=401, detail=str(e), headers={'WWW-Authenticate': SESSION_TOKEN_HEADER})
+    except ElementNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except (ParamValidationError, PathComputationError, TopologyError, EquipmentError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _current_session(token: Optional[str] = Security(_session_token)) -> NetworkSession:
+    with _http_errors():
+        return session_store.get(token)
 
 
 def _topology_and_equipment(data: Any):
@@ -58,95 +72,85 @@ def _topology_and_equipment(data: Any):
     return topology, equipment
 
 
-@app.post(NETWORKS_BASE_PATH, status_code=201)
-def create_network(
-    response: Response,
+@app.post(SESSIONS_PATH, status_code=201)
+def open_session(
     data: Any = Body(..., openapi_examples=_EXAMPLES, json_schema_extra=_SCHEMA),
     no_insert_edfas: bool = Query(False, alias='no-insert-edfas'),
 ):
-    """Load and design a network, and keep it in memory for the calls below."""
+    """Load and design a network, and return the token that selects it in the calls below."""
     with _http_errors():
         topology, equipment = _topology_and_equipment(data)
-        session = network_store.add(NetworkSession.from_json(topology, equipment, no_insert_edfas))
-    response.headers['Location'] = f'{NETWORKS_BASE_PATH}/{session.network_id}'
+        session = NetworkSession.from_json(topology, equipment, no_insert_edfas)
+    token = session_store.add(session)
+    return {'session-token': token, **session.summary()}
+
+
+@app.get(SESSION_PATH)
+def get_session(session: NetworkSession = Depends(_current_session)):
     return session.summary()
 
 
-@app.get(NETWORKS_BASE_PATH)
-def list_networks():
-    return {'networks': [session.summary() for session in network_store.list()]}
-
-
-@app.get(NETWORK_PATH)
-def get_network(network_id: str):
+@app.delete(SESSION_PATH, status_code=204)
+def close_session(token: Optional[str] = Security(_session_token)):
+    """End the session: the network is released and the token stops working."""
     with _http_errors():
-        return network_store.get(network_id).summary()
-
-
-@app.delete(NETWORK_PATH, status_code=204)
-def delete_network(network_id: str):
-    with _http_errors():
-        network_store.remove(network_id)
+        session_store.remove(token)
     return Response(status_code=204)
 
 
-@app.get(NETWORK_PATH + '/topology')
-def get_designed_topology(network_id: str):
+@app.get(SESSION_PATH + '/topology')
+def get_designed_topology(session: NetworkSession = Depends(_current_session)):
     """The designed network as GNPy topology JSON, including inserted amplifiers and split spans."""
-    with _http_errors():
-        return network_store.get(network_id).to_json()
+    return session.to_json()
 
 
-@app.get(NETWORK_PATH + '/elements')
-def list_elements(network_id: str, element_type: Optional[str] = Query(None, alias='type')):
-    with _http_errors():
-        return {'elements': network_store.get(network_id).describe_elements(element_type)}
+@app.get(SESSION_PATH + '/elements')
+def list_elements(session: NetworkSession = Depends(_current_session),
+                  element_type: Optional[str] = Query(None, alias='type')):
+    return {'elements': session.describe_elements(element_type)}
 
 
-@app.patch(NETWORK_PATH + '/elements')
-def update_elements(network_id: str, updates: Dict[str, Dict[str, Any]] = Body(
+@app.patch(SESSION_PATH + '/elements')
+def update_elements(session: NetworkSession = Depends(_current_session), updates: Dict[str, Dict[str, Any]] = Body(
         ..., examples=[{'fiber (Alice → Bob)-': {'loss_coef': 0.25, 'failed': False}}])):
     """Apply ``{uid: {attribute: value}}`` atomically; the network is not re-designed."""
     with _http_errors():
-        session = network_store.get(network_id)
         uids = session.update_elements(updates)
         return {'elements': [session.describe_element(uid) for uid in uids]}
 
 
-@app.get(NETWORK_PATH + '/elements/{uid:path}')
-def get_element(network_id: str, uid: str):
+@app.get(SESSION_PATH + '/elements/{uid:path}')
+def get_element(uid: str, session: NetworkSession = Depends(_current_session)):
     with _http_errors():
-        return network_store.get(network_id).describe_element(uid)
+        return session.describe_element(uid)
 
 
-@app.patch(NETWORK_PATH + '/elements/{uid:path}')
-def update_element(network_id: str, uid: str, attributes: Dict[str, Any] = Body(..., examples=[{'nf0': 6.0}])):
+@app.patch(SESSION_PATH + '/elements/{uid:path}')
+def update_element(uid: str, session: NetworkSession = Depends(_current_session),
+                   attributes: Dict[str, Any] = Body(..., examples=[{'nf0': 6.0}])):
     with _http_errors():
-        session = network_store.get(network_id)
         session.update_elements({uid: attributes})
         return session.describe_element(uid)
 
 
-@app.post(NETWORK_PATH + '/redesign')
-def redesign_network(network_id: str):
+@app.post(SESSION_PATH + '/redesign')
+def redesign_network(session: NetworkSession = Depends(_current_session)):
     """Re-run GNPy's design on the network as currently mutated."""
+    session.redesign()
+    return session.summary()
+
+
+@app.post(SESSION_PATH + '/paths')
+def compute_paths(request: PathComputationRequest, session: NetworkSession = Depends(_current_session)):
     with _http_errors():
-        session = network_store.get(network_id)
-        session.redesign()
-        return session.summary()
+        return session.compute_paths(request.source, request.destination, request.k)
 
 
-@app.post(NETWORK_PATH + '/paths')
-def compute_paths(network_id: str, request: PathComputationRequest):
-    with _http_errors():
-        return network_store.get(network_id).compute_paths(request.source, request.destination, request.k)
-
-
-@app.post(NETWORK_PATH + '/propagate')
-def propagate(network_id: str, request: PropagationRequest):
+@app.post(SESSION_PATH + '/propagate')
+def propagate(request: PropagationRequest, session: NetworkSession = Depends(_current_session)):
     with _http_errors():
         spectrum = request.spectrum.model_dump() if request.spectrum else None
-        return network_store.get(network_id).propagate(request.path, spectrum, request.include_channels)
+        return session.propagate(request.path, spectrum, request.include_channels)
 
 
 @app.get(API_VERSION + '/element-attributes')

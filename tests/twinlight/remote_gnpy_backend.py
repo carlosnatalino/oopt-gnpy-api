@@ -11,22 +11,24 @@ in-process ``GnpyBackend`` does, and covers the other places where TwinLight imp
 ==============================================  ============================================
 TwinLight call site (gnpy import)               gnpy-api call
 ==============================================  ============================================
-``gnpy_adapter.build_gnpy_network``             ``POST /networks``
-``gnpy_adapter.build_uid_map``                  ``GET /networks/{id}/elements``
-``gnpy_adapter.compute_path_baseline``          ``POST /networks/{id}/propagate``
-``element_params.read_attr / read_all``         ``GET /networks/{id}/elements/{uid}``
-``element_params.write_attr``                   ``PATCH /networks/{id}/elements/{uid}``
+``gnpy_adapter.build_gnpy_network``             ``POST /sessions``
+``gnpy_adapter.build_uid_map``                  ``GET /session/elements``
+``gnpy_adapter.compute_path_baseline``          ``POST /session/propagate``
+``element_params.read_attr / read_all``         ``GET /session/elements/{uid}``
+``element_params.write_attr``                   ``PATCH /session/elements/{uid}``
 ``element_params.schema``                       ``GET /element-attributes``
-``GnpyBackend.redesign`` (designed_network)     ``POST /networks/{id}/redesign``
+``GnpyBackend.redesign`` (designed_network)     ``POST /session/redesign``
 ``GnpyBackend.is_fiber`` (isinstance Fiber)     element type from the uid map
-``TapiContext.set_link_failed`` (edge removal)  ``PATCH /networks/{id}/elements/{uid}`` failed
-``TapiContext._get_path_via_gnpy``              ``POST /networks/{id}/paths``
-``egn_backend._designed_topology_json``         ``GET /networks/{id}/topology``
+``TapiContext.set_link_failed`` (edge removal)  ``PATCH /session/elements/{uid}`` failed
+``TapiContext._get_path_via_gnpy``              ``POST /session/paths``
+``egn_backend._designed_topology_json``         ``GET /session/topology``
 ``example_data.gnpy_example_data_dir``          ``GET /example-data/{name}``
 ==============================================  ============================================
 
-The real backend would use ``httpx.AsyncClient`` for ``compute_baseline``; this mock
-takes any ``httpx.Client`` so the tests can hand it FastAPI's ``TestClient``.
+Every ``/session`` call carries the token returned by ``POST /sessions`` in the
+``X-Session-Token`` header. The real backend would use ``httpx.AsyncClient`` for
+``compute_baseline``; this mock takes any ``httpx.Client`` so the tests can hand it
+FastAPI's ``TestClient``.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ import httpx
 _logger = logging.getLogger(__name__)
 
 API = '/api/v1.0'
+SESSION_TOKEN_HEADER = 'X-Session-Token'
 
 # TwinLight's propagation comb (gnpy_adapter.py): 88 x 50 GHz slots centred on 193.1 THz.
 _F_CENTER_HZ = 193.1e12
@@ -58,6 +61,15 @@ MODULATION_TABLE = {
 
 class ParamValidationError(ValueError):
     """Same role as TwinLight's ``physics.element_params.ParamValidationError``."""
+
+
+class SessionLostError(RuntimeError):
+    """The service no longer knows the token, e.g. after a restart.
+
+    TwinLight would call :meth:`RemoteGnpyBackend.reopen`, then replay the element overrides
+    and failed links it already keeps for snapshots (``TapiContext._element_overrides`` and
+    ``_failed_links``), and retry.
+    """
 
 
 @dataclass
@@ -91,7 +103,7 @@ class _UidStub:
 
 
 class RemoteGnpyBackend:
-    """``PhysicalBackend`` whose GNPy network lives in a gnpy-api network session."""
+    """``PhysicalBackend`` whose GNPy network lives in a gnpy-api session."""
 
     name = 'gnpy'
 
@@ -102,22 +114,31 @@ class RemoteGnpyBackend:
         # No local DiGraph: TapiContext asks compute_path() instead of running
         # compute_constrained_path on self.network.
         self.network = None
-        self.network_id: Optional[str] = None
         self._schema: Optional[dict] = None
+        self._token: Optional[str] = None
+        self._network = {'gnpy-api:topology': topology, 'gnpy-api:equipment': equipment}
+        self._no_insert_edfas = no_insert_edfas
         try:
-            created = self._call('POST', '/networks', params={'no-insert-edfas': no_insert_edfas},
-                                 json={'gnpy-api:topology': topology, 'gnpy-api:equipment': equipment})
-            self.network_id = created['network-id']
-            self._refresh_uid_map()
-            self.available = True
+            self.reopen()
         except (httpx.HTTPError, ParamValidationError) as exc:
             # Same contract as GnpyBackend: never take the twin down, fall back to mock OPM.
             _logger.warning('gnpy-api network load failed (%s) - using mock data', exc)
 
+    def reopen(self):
+        """Open a session on the network as loaded from file; earlier changes are not replayed."""
+        created = self._call('POST', '/sessions', params={'no-insert-edfas': self._no_insert_edfas},
+                             json=self._network)
+        self._token = created['session-token']
+        self._refresh_uid_map()
+        self.available = True
+
     # -- transport ---------------------------------------------------------
 
     def _call(self, method: str, path: str, **kwargs) -> Any:
-        response = self._http.request(method, API + path, **kwargs)
+        headers = {SESSION_TOKEN_HEADER: self._token} if self._token else {}
+        response = self._http.request(method, API + path, headers=headers, **kwargs)
+        if response.status_code == 401:
+            raise SessionLostError(_detail(response))
         if response.status_code == 404:
             raise KeyError(_detail(response))
         if response.status_code in (400, 422):
@@ -125,15 +146,12 @@ class RemoteGnpyBackend:
         response.raise_for_status()
         return response.json() if response.content else None
 
-    def _network_path(self, suffix: str = '') -> str:
-        return f'/networks/{self.network_id}{suffix}'
-
     def _element_path(self, uid: str) -> str:
         # Real uids carry spaces, arrows and slashes: "fiber (Abilene → Dallas)-_(1/4)".
-        return self._network_path(f'/elements/{quote(uid, safe="")}')
+        return f'/session/elements/{quote(uid, safe="")}'
 
     def _refresh_uid_map(self):
-        elements = self._call('GET', self._network_path('/elements'))['elements']
+        elements = self._call('GET', '/session/elements')['elements']
         self.uid_map = {
             el['uid']: _UidStub(el['uid'], el['type'],
                                 SimpleNamespace(length=el['length-km'] * 1000.0) if 'length-km' in el else None)
@@ -156,7 +174,7 @@ class RemoteGnpyBackend:
             'tx-power-dbm': tx_power_dbm,
         }
         try:
-            result = self._call('POST', self._network_path('/propagate'),
+            result = self._call('POST', '/session/propagate',
                                 json={'path': path_uids, 'spectrum': spectrum})
         except (httpx.HTTPError, KeyError, ParamValidationError) as exc:
             _logger.warning('gnpy-api baseline computation failed: %s', exc)
@@ -185,7 +203,7 @@ class RemoteGnpyBackend:
     def redesign(self):
         if not self.available:
             return
-        self._call('POST', self._network_path('/redesign'))
+        self._call('POST', '/session/redesign')
         self._refresh_uid_map()
 
     def is_fiber(self, uid: str) -> bool:
@@ -200,18 +218,18 @@ class RemoteGnpyBackend:
 
     def compute_path(self, src_uid: str, dst_uid: str, k: int = 1) -> List[List[str]]:
         """Replaces ``TapiContext._get_path_via_gnpy`` (and the k-shortest fallback when k > 1)."""
-        result = self._call('POST', self._network_path('/paths'),
+        result = self._call('POST', '/session/paths',
                             json={'source': src_uid, 'destination': dst_uid, 'k': k})
         return [path['uids'] for path in result['paths']]
 
     def designed_topology(self) -> dict:
         """Replaces ``egn_backend._designed_topology_json``: GNPy's amplifier placement, as JSON."""
-        return self._call('GET', self._network_path('/topology'))
+        return self._call('GET', '/session/topology')
 
     def close(self):
-        if self.network_id is not None:
-            self._call('DELETE', self._network_path())
-            self.network_id = None
+        if self._token is not None:
+            self._call('DELETE', '/session')
+            self._token = None
             self.available = False
 
 

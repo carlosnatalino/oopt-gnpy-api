@@ -1,4 +1,4 @@
-# Network sessions
+# Sessions
 
 `POST /api/v1.0/path-request` is stateless: every call loads the topology, designs the
 network and plans the services from scratch. A digital twin needs more control. It
@@ -10,32 +10,39 @@ designs a network once, and then repeatedly:
   without re-running the design afterwards,
 * fails and restores fibers.
 
-A **network session** keeps a designed GNPy network in the service's memory between
-calls, so it supports all of the above. Every endpoint below sits under `/api/v1.0`.
+A **session** keeps a designed GNPy network in the service's memory between calls, so it
+supports all of the above. Opening a session returns a **session token**. Every later call
+sends the token in the `X-Session-Token` header. The token is the only thing linking calls
+to a session: no cookie or HTTP connection is involved, so any client holding the token can
+use the session.
+
+Every endpoint below sits under `/api/v1.0`.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/networks` | Load and design a network; returns `201` with its `network-id` |
-| `GET` | `/networks` | List the sessions held by the service |
-| `GET` | `/networks/{id}` | Summary: element counts, failed fibers |
-| `DELETE` | `/networks/{id}` | Release the session |
-| `GET` | `/networks/{id}/elements[?type=Fiber]` | Elements of the *designed* network, with mutable attributes |
-| `GET` | `/networks/{id}/elements/{uid}` | One element |
-| `PATCH` | `/networks/{id}/elements/{uid}` | Change attributes of one element |
-| `PATCH` | `/networks/{id}/elements` | Change attributes of several elements in one atomic batch |
-| `POST` | `/networks/{id}/redesign` | Re-run GNPy's design on the network as currently mutated |
-| `POST` | `/networks/{id}/paths` | Up to `k` shortest paths between two transceivers |
-| `POST` | `/networks/{id}/propagate` | Propagate a comb along a path and report QoT |
-| `GET` | `/networks/{id}/topology` | The designed network as GNPy topology JSON |
-| `GET` | `/element-attributes` | Mutable attributes per element type, with units and ranges |
-| `GET` | `/example-data`, `/example-data/{name}` | JSON reference files shipped with GNPy |
+| Method | Path | Token | Purpose |
+|--------|------|-------|---------|
+| `POST` | `/sessions` | | Load and design a network; returns `201` with the `session-token` |
+| `GET` | `/session` | yes | Summary: element counts, failed fibers |
+| `DELETE` | `/session` | yes | End the session: the network is released and the token stops working |
+| `GET` | `/session/elements[?type=Fiber]` | yes | Elements of the *designed* network, with mutable attributes |
+| `GET` | `/session/elements/{uid}` | yes | One element |
+| `PATCH` | `/session/elements/{uid}` | yes | Change attributes of one element |
+| `PATCH` | `/session/elements` | yes | Change attributes of several elements in one atomic batch |
+| `POST` | `/session/redesign` | yes | Re-run GNPy's design on the network as currently mutated |
+| `POST` | `/session/paths` | yes | Up to `k` shortest paths between two transceivers |
+| `POST` | `/session/propagate` | yes | Propagate a comb along a path and report QoT |
+| `GET` | `/session/topology` | yes | The designed network as GNPy topology JSON |
+| `GET` | `/element-attributes` | | Mutable attributes per element type, with units and ranges |
+| `GET` | `/example-data`, `/example-data/{name}` | | JSON reference files shipped with GNPy |
 
 Element uids may contain spaces, arrows and slashes (`fiber (Abilene → Dallas)-_(1/4)`).
 Percent-encode them in the URL.
 
-## Creating a network
+The OpenAPI page (`/docs`) declares the header as the `SessionToken` security scheme: paste
+the token once under "Authorize" and every session call sends it.
+
+## Opening and ending a session
 
 The body takes the same two formats as `/path-request`, without the services: the RFC 7951
 envelope (`gnpy-api:api` holding `gnpy-network-topology:topology` and
@@ -44,14 +51,14 @@ envelope (`gnpy-api:api` holding `gnpy-network-topology:topology` and
 `no_insert_edfas` design option.
 
 ```bash
-curl -X POST 'http://localhost:8080/api/v1.0/networks' \
+curl -X POST 'http://localhost:8080/api/v1.0/sessions' \
      -H 'Content-Type: application/json' \
      -d '{"gnpy-api:topology": {...}, "gnpy-api:equipment": {...}}'
 ```
 
 ```json
 {
-  "network-id": "c865d3b8-a4c8-4065-a37b-abefdd03f416",
+  "session-token": "hKrsg_m1Vb0R7v3w4bqQ2mN8xYk5tJcLpUe9aD6sF0E",
   "network-name": null,
   "element-count": 38,
   "element-types": {"Transceiver": 5, "Roadm": 5, "Fiber": 10, "Edfa": 18},
@@ -59,6 +66,18 @@ curl -X POST 'http://localhost:8080/api/v1.0/networks' \
   "no-insert-edfas": false
 }
 ```
+
+```bash
+TOKEN='hKrsg_m1Vb0R7v3w4bqQ2mN8xYk5tJcLpUe9aD6sF0E'
+curl -X POST 'http://localhost:8080/api/v1.0/session/paths' \
+     -H "X-Session-Token: $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"source": "trx Alice", "destination": "trx Bob"}'
+curl -X DELETE 'http://localhost:8080/api/v1.0/session' -H "X-Session-Token: $TOKEN"
+```
+
+The token is 43 URL-safe characters drawn from 256 random bits. Only the response to
+`POST /sessions` contains it. No endpoint lists sessions, and error messages do not echo
+tokens.
 
 The element list reflects the network after design. That includes amplifiers GNPy inserted
 and long spans it split into sub-spans.
@@ -95,18 +114,18 @@ On a fiber, the pseudo-attribute `failed` (boolean) cuts or restores the fiber. 
 fiber is excluded from path computation. A propagation through it returns
 `"status": "link-failed"`.
 
-`PATCH /networks/{id}/elements` takes `{uid: {attribute: value}}`. Every update is
+`PATCH /session/elements` takes `{uid: {attribute: value}}`. Every update is
 validated before any is written: a single invalid value rejects the whole batch with `400`
 and leaves the network untouched.
 
 Parameter changes do not re-run the design. To re-equalise ROADMs and amplifier operating
-points against the changed parameters, call `POST /networks/{id}/redesign`. GNPy caches
+points against the changed parameters, call `POST /session/redesign`. GNPy caches
 each span's design loss after the first design. The redesign endpoint clears that cache,
 so a changed `loss_coef` or `att_in` does reach the amplifier gains.
 
 ## Paths
 
-`POST /networks/{id}/paths` with:
+`POST /session/paths` with:
 
 ```json
 {"source": "trx Alice", "destination": "trx Bob", "k": 2}
@@ -131,7 +150,7 @@ path exists, `paths` is empty and `blocking-reason` is `NO_PATH`.
 
 ## Propagation
 
-`POST /networks/{id}/propagate` with:
+`POST /session/propagate` with:
 
 ```json
 {
@@ -193,15 +212,16 @@ number of channels launched.
 | Status | When |
 |--------|------|
 | `400` | Invalid topology or equipment, attribute not writable or out of range, unknown or disconnected uid in a path, path endpoints that are not transceivers, empty spectrum |
-| `404` | Unknown network id or element uid |
+| `401` | Missing, unknown or closed session token: open a new session |
+| `404` | Unknown element uid |
 | `422` | Body does not match the request schema |
 
 ## Operational notes
 
 * Sessions live in the memory of one service process. They do not survive a restart and
-  are not shared between replicas. A client should recreate its session when it gets a
-  `404` for its network id.
+  are not shared between replicas. A client that gets a `401` should open a new session and
+  replay the changes it had applied.
 * Requests on one session are serialised for parameter changes and redesign. Propagation
   works on deep copies of the path elements and can run concurrently.
-* There is no limit on the number of sessions yet. Clients should `DELETE` sessions they no
-  longer need.
+* There is no limit on the number of sessions and no expiry yet. Clients should end
+  sessions they no longer need with `DELETE /session`.

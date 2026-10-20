@@ -45,18 +45,21 @@ The example server runs over HTTP. Use a reverse proxy or uvicorn TLS settings f
 docker run --rm -p 8080:8080 gnpy-api
 ```
 
-## 🔁 Network sessions
+## 🔁 Sessions
 `/path-request` designs the network again on every call. Digital twins and other SDN
-controllers can instead keep a designed network in the service and work on it step by step:
+controllers can instead open a session that keeps a designed network in the service, and
+work on it step by step. Calls find the session through a token, sent in a header:
 ```bash
-# load and design once; the response carries the network-id
-curl -X POST 'http://localhost:8080/api/v1.0/networks' --header 'Content-Type: application/json' \
+# load and design once; the response carries the session-token
+curl -X POST 'http://localhost:8080/api/v1.0/sessions' --header 'Content-Type: application/json' \
      --data '{"gnpy-api:topology": {...}, "gnpy-api:equipment": {...}}'
 # then compute paths, propagate, change parameters, fail fibers, redesign
-curl -X POST "http://localhost:8080/api/v1.0/networks/$NETWORK_ID/paths" \
+curl -X POST 'http://localhost:8080/api/v1.0/session/paths' --header "X-Session-Token: $TOKEN" \
      --header 'Content-Type: application/json' --data '{"source": "trx Alice", "destination": "trx Bob"}'
+# and end the session when done
+curl -X DELETE 'http://localhost:8080/api/v1.0/session' --header "X-Session-Token: $TOKEN"
 ```
-See [docs/network-api.md](docs/network-api.md) for every endpoint. `tests/twinlight/` shows
+See [docs/session-api.md](docs/session-api.md) for every endpoint. `tests/twinlight/` shows
 how the [TwinLight](https://github.com/carlosnatalino/TwinLight) digital twin would use them
 in place of importing GNPy.
 

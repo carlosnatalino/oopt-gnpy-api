@@ -12,8 +12,8 @@ way to express a parameter change that should *not* be followed by a re-design.
 import copy
 import logging
 import math
+import secrets
 import threading
-import uuid
 from collections import Counter
 from itertools import islice
 from typing import Any, Dict, List, Optional
@@ -28,9 +28,9 @@ from gnpy.tools.worker_utils import designed_network
 
 from gnpyapi.core.exception.element_not_found_error import ElementNotFoundError
 from gnpyapi.core.exception.equipment_error import EquipmentError
-from gnpyapi.core.exception.network_not_found_error import NetworkNotFoundError
 from gnpyapi.core.exception.param_validation_error import ParamValidationError
 from gnpyapi.core.exception.path_computation_error import PathComputationError
+from gnpyapi.core.exception.session_not_found_error import SessionNotFoundError
 from gnpyapi.core.exception.topology_error import TopologyError
 from gnpyapi.core.service import element_attributes
 
@@ -56,8 +56,7 @@ def _fiber_km(element) -> float:
 class NetworkSession:
     """A designed GNPy network plus the runtime state a twin layers on top of it."""
 
-    def __init__(self, network_id: str, equipment: dict, network, no_insert_edfas: bool = False):
-        self.network_id = network_id
+    def __init__(self, equipment: dict, network, no_insert_edfas: bool = False):
         self.equipment = equipment
         self.network = network
         self.no_insert_edfas = no_insert_edfas
@@ -79,14 +78,13 @@ class NetworkSession:
         except NetworkTopologyError as e:
             _logger.error(f"A topology error occurred: {e}")
             raise TopologyError(str(e))
-        return cls(str(uuid.uuid4()), equipment, network, no_insert_edfas)
+        return cls(equipment, network, no_insert_edfas)
 
     # -- inventory ---------------------------------------------------------
 
     def summary(self) -> dict:
         with self.lock:
             return {
-                'network-id': self.network_id,
                 'network-name': self.network.graph.get('network_name'),
                 'element-count': len(self.uid_map),
                 'element-types': dict(Counter(type(el).__name__ for el in self.uid_map.values())),
@@ -98,7 +96,7 @@ class NetworkSession:
         try:
             return self.uid_map[uid]
         except KeyError:
-            raise ElementNotFoundError(f'Unknown element uid {uid!r} in network {self.network_id}')
+            raise ElementNotFoundError(f'Unknown element uid {uid!r}')
 
     def describe_element(self, uid: str) -> dict:
         with self.lock:
@@ -171,7 +169,7 @@ class NetworkSession:
     def _transceiver(self, uid: str):
         element = self.uid_map.get(uid)
         if not isinstance(element, Transceiver):
-            raise PathComputationError(f'{uid!r} is not a transceiver of network {self.network_id}')
+            raise PathComputationError(f'{uid!r} is not a transceiver')
         return element
 
     def compute_paths(self, source: str, destination: str, k: int = 1) -> dict:
@@ -301,33 +299,34 @@ class NetworkSession:
         return channels
 
 
-class NetworkStore:
-    """In-memory registry of network sessions, keyed by network id."""
+class SessionStore:
+    """In-memory registry of network sessions, keyed by an unguessable token.
+
+    The token is the only credential for a session: it is never listed, and error messages
+    do not echo it, so it cannot leak into responses or logs.
+    """
 
     def __init__(self):
         self._sessions: Dict[str, NetworkSession] = {}
         self._lock = threading.Lock()
 
-    def add(self, session: NetworkSession) -> NetworkSession:
+    def add(self, session: NetworkSession) -> str:
+        token = secrets.token_urlsafe(32)
         with self._lock:
-            self._sessions[session.network_id] = session
+            self._sessions[token] = session
+        return token
+
+    def get(self, token: Optional[str]) -> NetworkSession:
+        with self._lock:
+            session = self._sessions.get(token) if token else None
+        if session is None:
+            raise SessionNotFoundError('Missing, unknown or closed session token')
         return session
 
-    def get(self, network_id: str) -> NetworkSession:
+    def remove(self, token: Optional[str]):
         with self._lock:
-            try:
-                return self._sessions[network_id]
-            except KeyError:
-                raise NetworkNotFoundError(f'Unknown network id {network_id!r}')
-
-    def remove(self, network_id: str):
-        with self._lock:
-            if self._sessions.pop(network_id, None) is None:
-                raise NetworkNotFoundError(f'Unknown network id {network_id!r}')
-
-    def list(self) -> List[NetworkSession]:
-        with self._lock:
-            return list(self._sessions.values())
+            if not token or self._sessions.pop(token, None) is None:
+                raise SessionNotFoundError('Missing, unknown or closed session token')
 
 
-network_store = NetworkStore()
+session_store = SessionStore()
